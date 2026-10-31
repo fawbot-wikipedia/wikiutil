@@ -1,0 +1,18 @@
+[project]
+name = "wikiutil"
+version = "0.1.0"
+description = "ウィキペディア関連のツールで共有する、MediaWiki API・ダンプ・ファイル保存・仮リンクの処理"
+readme = "README.md"
+requires-python = ">=3.15"
+dependencies = [
+    "requests>=2.32.5",
+    "tqdm>=4.70.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "wikiutil"
+module-root = ""
