@@ -18,6 +18,9 @@ REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_MIN_INTERVAL_SECONDS = 1.0
 MAX_RETRIES = 5
 MAX_BACKOFF_SECONDS = 60
+DEFAULT_MAXLAG_SECONDS = 5
+# maxlag の応答に Retry-After がない場合の待機（秒）。
+DEFAULT_MAXLAG_WAIT_SECONDS = 5
 RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 # MediaWikiがページ名から取り除く方向制御文字（LRM・RLM・LRE〜RLO）。
 _DIRECTION_MARKS = dict.fromkeys([0x200E, 0x200F, *range(0x202A, 0x202F)])
@@ -25,6 +28,15 @@ _DIRECTION_MARKS = dict.fromkeys([0x200E, 0x200F, *range(0x202A, 0x202F)])
 
 class MediaWikiError(RuntimeError):
     """MediaWiki API操作の失敗を表す。"""
+
+
+class MediaWikiAPIError(MediaWikiError):
+    """APIがエラーを返した。エラーコードを `code` に持つ。"""
+
+    def __init__(self, error: Any) -> None:
+        """応答の `error` を受け取る。"""
+        super().__init__("MediaWiki APIがエラーを返しました: {}".format(error))
+        self.code = error.get("code") if isinstance(error, dict) else None
 
 
 def api_url(language: str) -> str:
@@ -72,16 +84,15 @@ def json_from_response(response: requests.Response) -> dict[str, Any]:
 
     Raises:
         requests.HTTPError: HTTPエラー応答の場合。
-        MediaWikiError: JSONがオブジェクトでないか、APIエラーを含む場合。
+        MediaWikiError: JSONがオブジェクトでない場合。
+        MediaWikiAPIError: APIエラーを含む場合。
     """
     response.raise_for_status()
     data = response.json()
     if not isinstance(data, dict):
         raise MediaWikiError("MediaWiki APIの応答の形式が不正です")
     if "error" in data:
-        raise MediaWikiError(
-            "MediaWiki APIがエラーを返しました: {}".format(data["error"])
-        )
+        raise MediaWikiAPIError(data["error"])
     return data
 
 
@@ -158,6 +169,9 @@ class MediaWikiSession(requests.Session):
     ) -> requests.Response:
         """間隔制御と再試行を行ってHTTP要求を送る。
 
+        `retry=False` を渡すと、`retry_methods` に含まれるメソッドでも
+        再試行しない。
+
         Raises:
             requests.ConnectionError: 再試行後も接続できない場合。
             requests.Timeout: 再試行後もタイムアウトした場合。
@@ -165,12 +179,13 @@ class MediaWikiSession(requests.Session):
                 途中で切れる場合。
         """
         kwargs.setdefault("timeout", self.timeout)
+        retry = kwargs.pop("retry", True)
         method_name = (
             method.decode() if isinstance(method, bytes) else method
         ).upper()
         url_text = url.decode() if isinstance(url, bytes) else url
         host = urlparse(url_text).hostname or ""
-        retryable = method_name in self.retry_methods
+        retryable = retry and method_name in self.retry_methods
         attempt = 0
         while True:
             self._wait_for_host(host)
@@ -220,3 +235,167 @@ class MediaWikiSession(requests.Session):
     def post_json(self, url: str, data: Mapping[str, Any]) -> dict[str, Any]:
         """POST要求を送り、MediaWiki APIのJSON応答を返す。"""
         return json_from_response(self.post(url, data=data))
+
+    def _token(self, url: str, token_type: str) -> str:
+        """指定した種類のトークンを取得する。"""
+        data = self.get_json(
+            url,
+            {
+                "action": "query",
+                "meta": "tokens",
+                "type": token_type,
+                "format": "json",
+                "formatversion": 2,
+            },
+        )
+        token = data.get("query", {}).get("tokens", {}).get(
+            "{}token".format(token_type)
+        )
+        if not isinstance(token, str):
+            raise MediaWikiError(
+                "{}トークンを取得できません".format(token_type)
+            )
+        return token
+
+    def login(self, url: str, username: str, password: str) -> None:
+        """BotPasswordでログインする。以降の要求はログインした状態で送る。
+
+        Args:
+            url: APIのURL。
+            username: `利用者名@BotPassword名` の形のログイン名。
+            password: BotPasswordのパスワード。
+
+        Raises:
+            MediaWikiError: ログインできない場合。パスワードは含めない。
+        """
+        token = self._token(url, "login")
+        data = self.post_json(
+            url,
+            {
+                "action": "login",
+                "lgname": username,
+                "lgpassword": password,
+                "lgtoken": token,
+                "format": "json",
+                "formatversion": 2,
+            },
+        )
+        result = data.get("login", {})
+        if result.get("result") != "Success":
+            raise MediaWikiError(
+                "BotPasswordでログインできません: {} {}".format(
+                    result.get("result"), result.get("reason", "")
+                ).rstrip()
+            )
+
+    def csrf_token(self, url: str) -> str:
+        """編集に使うCSRFトークンを取得する。"""
+        return self._token(url, "csrf")
+
+    def user_info(self, url: str) -> dict[str, Any]:
+        """ログイン中の利用者の名前・グループ・新着メッセージの有無を返す。
+
+        Returns:
+            `meta=userinfo` の応答。`name`・`groups` を持ち、会話ページに
+            新しいメッセージがあれば `messages` が真になる。
+        """
+        data = self.get_json(
+            url,
+            {
+                "action": "query",
+                "meta": "userinfo",
+                "uiprop": "groups|hasmsg",
+                "format": "json",
+                "formatversion": 2,
+            },
+        )
+        info = data.get("query", {}).get("userinfo")
+        if not isinstance(info, dict):
+            raise MediaWikiError("利用者の情報を取得できません")
+        return info
+
+    def edit(
+        self,
+        url: str,
+        *,
+        title: str,
+        text: str,
+        summary: str,
+        token: str,
+        base_revision_id: int,
+        base_timestamp: str,
+        start_timestamp: str,
+        bot: bool,
+        assertion: str = "user",
+        maxlag: int = DEFAULT_MAXLAG_SECONDS,
+    ) -> dict[str, Any]:
+        """既存のページの本文を置き換える。
+
+        編集の競合と、取得後の削除を検出するため、本文を取得した版と時刻を
+        渡す。ページがなければ作らない。HTTPの失敗では送り直さない（編集が
+        反映されたか分からないため）。`maxlag` で断られた場合は、反映されて
+        いないので、待って送り直す。
+
+        Args:
+            url: APIのURL。
+            title: ページ名。
+            text: 新しい本文。
+            summary: 編集の要約。
+            token: CSRFトークン。
+            base_revision_id: 本文を取得した版のID。
+            base_timestamp: 本文を取得した版の時刻。
+            start_timestamp: 本文の取得を始めた時刻。
+            bot: ボットの編集として記録するか。
+            assertion: 送る前に確かめる状態（`user` または `bot`）。
+            maxlag: サーバーの遅延の許容秒数。
+
+        Returns:
+            応答の `edit`。`newrevid` を持ち、本文が同じなら `nochange` を持つ。
+
+        Raises:
+            MediaWikiAPIError: 編集の競合などのAPIエラーの場合。
+            MediaWikiError: 結果が `Success` でない場合や、混雑が続く場合。
+        """
+        data = {
+            "action": "edit",
+            "title": title,
+            "text": text,
+            "summary": summary,
+            "token": token,
+            "baserevid": base_revision_id,
+            "basetimestamp": base_timestamp,
+            "starttimestamp": start_timestamp,
+            "nocreate": 1,
+            "watchlist": "nochange",
+            "assert": assertion,
+            "maxlag": maxlag,
+            "format": "json",
+            "formatversion": 2,
+        }
+        if bot:
+            data["bot"] = 1
+        for attempt in range(self.max_retries + 1):
+            response = self.post(url, data=data, retry=False)
+            try:
+                result = json_from_response(response)
+            except MediaWikiAPIError as error:
+                if error.code != "maxlag" or attempt >= self.max_retries:
+                    raise
+                now = datetime.now(timezone.utc)
+                retry_at = parse_retry_after(
+                    response.headers.get("Retry-After"), now
+                )
+                delay = (
+                    (retry_at - now).total_seconds()
+                    if retry_at is not None
+                    else DEFAULT_MAXLAG_WAIT_SECONDS
+                )
+                self._retry("maxlag", url, max(0.0, delay))
+                continue
+            edit = result.get("edit", {})
+            if edit.get("result") != "Success":
+                raise MediaWikiError(
+                    "編集が保存されませんでした: {}".format(edit)
+                )
+            return edit
+        raise MediaWikiError("サーバーの混雑が続いたため編集を中止しました")

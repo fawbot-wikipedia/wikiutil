@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 import requests
 
 from wikiutil.mediawiki import (
+    MediaWikiAPIError,
     MediaWikiError,
     MediaWikiSession,
     api_url,
@@ -74,6 +75,14 @@ class HelperTests(unittest.TestCase):
 
         with self.assertRaises(MediaWikiError):
             json_from_response(response)
+
+    def test_api_error_keeps_error_code(self):
+        """APIエラーのコードを `code` に持つ。"""
+        response = _response(data={"error": {"code": "editconflict"}})
+
+        with self.assertRaises(MediaWikiAPIError) as raised:
+            json_from_response(response)
+        self.assertEqual(raised.exception.code, "editconflict")
 
 
 @patch("wikiutil.mediawiki.requests.Session.request")
@@ -168,6 +177,168 @@ class SessionTests(unittest.TestCase):
 
         self.assertEqual(len(self.sleeps), 1)
         self.assertGreater(self.sleeps[0], 4)
+
+    def test_does_not_retry_when_retry_is_false(self, request):
+        """`retry=False` の要求は、再試行してよいメソッドでも再試行しない。"""
+        request.return_value = _response(503)
+
+        response = self.session.get(api_url("ja"), retry=False)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(request.call_count, 1)
+        self.assertNotIn("retry", request.call_args.kwargs)
+
+
+_EDIT_ARGUMENTS = {
+    "title": "記事名",
+    "text": "本文",
+    "summary": "要約",
+    "token": "csrf+\\",
+    "base_revision_id": 100,
+    "base_timestamp": "2026-10-31T00:00:00Z",
+    "start_timestamp": "2026-10-31T01:00:00Z",
+}
+
+
+@patch("wikiutil.mediawiki.requests.Session.request")
+class AccountTests(unittest.TestCase):
+    """ログイン・トークン・利用者情報・編集を検証する。"""
+
+    def setUp(self):
+        """待機を記録し、POSTも再試行するSessionを用意する。"""
+        self.sleeps = []
+        self.session = MediaWikiSession(
+            default_interval=0,
+            retry_methods=("GET", "POST"),
+            sleep=self.sleeps.append,
+        )
+
+    def test_login_sends_token_and_credentials(self, request):
+        """ログイン用トークンを取得し、ログイン名・パスワードと送る。"""
+        request.side_effect = [
+            _response(data={"query": {"tokens": {"logintoken": "t+\\"}}}),
+            _response(data={"login": {"result": "Success"}}),
+        ]
+
+        self.session.login(api_url("ja"), "Bot@task", "secret")
+
+        sent = request.call_args.kwargs["data"]
+        self.assertEqual(sent["lgname"], "Bot@task")
+        self.assertEqual(sent["lgpassword"], "secret")
+        self.assertEqual(sent["lgtoken"], "t+\\")
+
+    def test_login_failure_hides_password(self, request):
+        """ログインの失敗は理由を示し、パスワードを含めない。"""
+        request.side_effect = [
+            _response(data={"query": {"tokens": {"logintoken": "t"}}}),
+            _response(
+                data={"login": {"result": "Failed", "reason": "Incorrect"}}
+            ),
+        ]
+
+        with self.assertRaises(MediaWikiError) as raised:
+            self.session.login(api_url("ja"), "Bot@task", "secret")
+        self.assertIn("Failed", str(raised.exception))
+        self.assertNotIn("secret", str(raised.exception))
+
+    def test_csrf_token(self, request):
+        """編集用のトークンを返す。"""
+        request.return_value = _response(
+            data={"query": {"tokens": {"csrftoken": "c+\\"}}}
+        )
+
+        self.assertEqual(self.session.csrf_token(api_url("ja")), "c+\\")
+
+    def test_user_info(self, request):
+        """利用者の名前・グループ・新着メッセージの有無を返す。"""
+        info = {"name": "Bot", "groups": ["user", "bot"], "messages": True}
+        request.return_value = _response(
+            data={"query": {"userinfo": info}}
+        )
+
+        self.assertEqual(self.session.user_info(api_url("ja")), info)
+        sent = request.call_args.kwargs["params"]
+        self.assertEqual(sent["uiprop"], "groups|hasmsg")
+
+    def test_edit_sends_conflict_checks(self, request):
+        """競合を検出する引数を付け、ページを作らない編集として送る。"""
+        request.return_value = _response(
+            data={"edit": {"result": "Success", "newrevid": 101}}
+        )
+
+        result = self.session.edit(
+            api_url("ja"), bot=False, **_EDIT_ARGUMENTS
+        )
+
+        self.assertEqual(result["newrevid"], 101)
+        sent = request.call_args.kwargs["data"]
+        self.assertEqual(sent["baserevid"], 100)
+        self.assertEqual(sent["basetimestamp"], "2026-10-31T00:00:00Z")
+        self.assertEqual(sent["starttimestamp"], "2026-10-31T01:00:00Z")
+        self.assertEqual(sent["nocreate"], 1)
+        self.assertEqual(sent["assert"], "user")
+        self.assertEqual(sent["maxlag"], 5)
+        self.assertNotIn("bot", sent)
+
+    def test_edit_as_bot(self, request):
+        """ボットの編集では `bot` と `assert=bot` を付ける。"""
+        request.return_value = _response(
+            data={"edit": {"result": "Success", "newrevid": 101}}
+        )
+
+        self.session.edit(
+            api_url("ja"), bot=True, assertion="bot", **_EDIT_ARGUMENTS
+        )
+
+        sent = request.call_args.kwargs["data"]
+        self.assertEqual(sent["bot"], 1)
+        self.assertEqual(sent["assert"], "bot")
+
+    def test_edit_waits_and_resends_on_maxlag(self, request):
+        """maxlag で断られたら、Retry-After だけ待って送り直す。"""
+        request.side_effect = [
+            _response(
+                data={"error": {"code": "maxlag"}},
+                headers={"Retry-After": "3"},
+            ),
+            _response(data={"edit": {"result": "Success", "newrevid": 101}}),
+        ]
+
+        self.session.edit(api_url("ja"), bot=False, **_EDIT_ARGUMENTS)
+
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(len(self.sleeps), 1)
+        self.assertAlmostEqual(self.sleeps[0], 3, delta=1)
+
+    def test_edit_does_not_resend_on_server_error(self, request):
+        """HTTPの失敗では、POSTを再試行するSessionでも送り直さない。"""
+        response = _response(503)
+        response.raise_for_status.side_effect = requests.HTTPError("503")
+        request.return_value = response
+
+        with self.assertRaises(requests.HTTPError):
+            self.session.edit(api_url("ja"), bot=False, **_EDIT_ARGUMENTS)
+        self.assertEqual(request.call_count, 1)
+
+    def test_edit_raises_on_conflict(self, request):
+        """編集の競合は、コード付きのAPIエラーにする。"""
+        request.return_value = _response(
+            data={"error": {"code": "editconflict"}}
+        )
+
+        with self.assertRaises(MediaWikiAPIError) as raised:
+            self.session.edit(api_url("ja"), bot=False, **_EDIT_ARGUMENTS)
+        self.assertEqual(raised.exception.code, "editconflict")
+        self.assertEqual(request.call_count, 1)
+
+    def test_edit_raises_when_not_saved(self, request):
+        """結果が Success でなければ、保存されなかったとして失敗にする。"""
+        request.return_value = _response(
+            data={"edit": {"result": "Failure", "captcha": {}}}
+        )
+
+        with self.assertRaises(MediaWikiError):
+            self.session.edit(api_url("ja"), bot=False, **_EDIT_ARGUMENTS)
 
 
 if __name__ == "__main__":

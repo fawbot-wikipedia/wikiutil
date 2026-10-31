@@ -1,6 +1,6 @@
 [project]
 name = "wikiutil"
-version = "0.1.0"
+version = "0.2.0"
 description = "ウィキペディア関連のツールで共有する、MediaWiki API・ダンプ・ファイル保存・仮リンクの処理"
 readme = "README.md"
 requires-python = ">=3.15"
